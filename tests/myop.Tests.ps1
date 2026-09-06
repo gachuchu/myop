@@ -553,6 +553,66 @@ Describe 'myop run' {
 
         $LASTEXITCODE | Should -Be 42
     }
+
+    Context '環境変数のスコープ' {
+        AfterEach {
+            # テストで作った環境変数が他のテストへ漏れないようにする
+            foreach ($name in @('MYOP_T_LEFTOVER', 'MYOP_T_EXISTING', 'MYOP_T_ONFAIL', 'MYOP_T_SECRET')) {
+                [System.Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            }
+        }
+
+        It '実行後に平文の環境変数がセッションへ残らない' {
+            $envFile = Join-Path $TestDrive 'scope-plain.env'
+            Set-Content -Path $envFile -Value 'MYOP_T_LEFTOVER=some-value'
+            [System.Environment]::GetEnvironmentVariable('MYOP_T_LEFTOVER', 'Process') | Should -BeNullOrEmpty
+
+            myop run --env-file=$envFile -- pwsh -NoProfile -Command '1' | Out-Null
+
+            [System.Environment]::GetEnvironmentVariable('MYOP_T_LEFTOVER', 'Process') | Should -BeNullOrEmpty
+        }
+
+        It '実行後に復号したシークレットがセッションへ残らない' {
+            $envFile = Join-Path $TestDrive 'scope-secret.env'
+            Set-Content -Path $envFile -Value 'MYOP_T_SECRET="op://Personal/RunTest/credential"'
+
+            myop run --env-file=$envFile -- pwsh -NoProfile -Command '1' | Out-Null
+
+            [System.Environment]::GetEnvironmentVariable('MYOP_T_SECRET', 'Process') | Should -BeNullOrEmpty
+        }
+
+        It '元から設定されていた環境変数は実行前の値に戻る' {
+            [System.Environment]::SetEnvironmentVariable('MYOP_T_EXISTING', 'original-value', 'Process')
+            $envFile = Join-Path $TestDrive 'scope-restore.env'
+            Set-Content -Path $envFile -Value 'MYOP_T_EXISTING=overwritten-value'
+
+            myop run --env-file=$envFile -- pwsh -NoProfile -Command '1' | Out-Null
+
+            [System.Environment]::GetEnvironmentVariable('MYOP_T_EXISTING', 'Process') | Should -Be 'original-value'
+        }
+
+        It '子コマンドが異常終了しても環境変数は復元される' {
+            $envFile = Join-Path $TestDrive 'scope-onfail.env'
+            Set-Content -Path $envFile -Value 'MYOP_T_ONFAIL=some-value'
+
+            myop run --env-file=$envFile -- pwsh -NoProfile -Command 'exit 1' | Out-Null
+
+            [System.Environment]::GetEnvironmentVariable('MYOP_T_ONFAIL', 'Process') | Should -BeNullOrEmpty
+        }
+
+        It '実行中は子プロセスから値を読める' {
+            # 復元処理を入れても、コマンド実行中の注入が壊れていないことを確認する
+            $envFile = Join-Path $TestDrive 'scope-during.env'
+            Set-Content -Path $envFile -Value @(
+                'MYOP_T_SECRET="op://Personal/RunTest/credential"'
+                'MYOP_T_LEFTOVER=plain-value'
+            )
+
+            $out = myop run --env-file=$envFile -- pwsh -NoProfile -Command '"$env:MYOP_T_SECRET|$env:MYOP_T_LEFTOVER"'
+
+            ($out | Out-String).Trim() | Should -Be 'injected-secret|plain-value'
+        }
+    }
 }
 
 Describe '実ユーザーのコンテナ保護' {

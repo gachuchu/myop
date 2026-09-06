@@ -425,34 +425,57 @@ function myop {
     }
 
     # 5. シークレットの展開と環境変数への注入
+    #    コマンド終了後に呼び出し元のセッションへ平文を残さないよう、上書き前の値を控えておく
     $vaultData = Initialize-MyVault
-    foreach ($entry in (ConvertFrom-MyDotEnv -Path $envFilePath)) {
-        if ($entry.Kind -ne 'Entry') { continue }
+    $originalEnv = @{}
 
-        if ($entry.IsOpPath) {
-            if ($vaultData.ContainsKey($entry.Value)) {
-                $SecureSecret = $vaultData[$entry.Value]
-                $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
-                try {
-                    $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-                    [System.Environment]::SetEnvironmentVariable($entry.Key, $PlainSecret, "Process")
-                }
-                finally {
-                    # 非管理メモリ上の平文をゼロ埋めして解放する
-                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+    try {
+        foreach ($entry in (ConvertFrom-MyDotEnv -Path $envFilePath)) {
+            if ($entry.Kind -ne 'Entry') { continue }
+
+            # 同じキーが複数行にある場合も、最初に見た時点の値だけを控える
+            if (-not $originalEnv.ContainsKey($entry.Key)) {
+                $originalEnv[$entry.Key] = [System.Environment]::GetEnvironmentVariable($entry.Key, "Process")
+            }
+
+            if ($entry.IsOpPath) {
+                if ($vaultData.ContainsKey($entry.Value)) {
+                    $SecureSecret = $vaultData[$entry.Value]
+                    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
+                    try {
+                        $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+                        [System.Environment]::SetEnvironmentVariable($entry.Key, $PlainSecret, "Process")
+                    }
+                    finally {
+                        # 非管理メモリ上の平文をゼロ埋めして解放する
+                        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+                    }
+                } else {
+                    Write-Warning "暗号化コンテナ内に該当するパスが見つかりません: $($entry.Value)"
                 }
             } else {
-                Write-Warning "暗号化コンテナ内に該当するパスが見つかりません: $($entry.Value)"
+                [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
             }
-        } else {
-            [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+
+        # 6. コマンドの実行（引数の有無に関わらずPowerShell 7で安全にアンパックして評価）
+        $exe = $appCommand[0]
+        $argsLeft = $appCommand | Select-Object -Skip 1
+        & $exe $argsLeft
+    }
+    finally {
+        # 7. 環境変数を実行前の状態へ戻す。
+        #    元が未設定だったキーは $null を設定することで削除される。
+        #    途中で止まると平文が残るため、1 つ失敗しても残りを必ず処理する。
+        foreach ($key in $originalEnv.Keys) {
+            try {
+                [System.Environment]::SetEnvironmentVariable($key, $originalEnv[$key], "Process")
+            }
+            catch {
+                Write-Warning "環境変数の復元に失敗しました: $key"
+            }
         }
     }
-
-    # 6. コマンドの実行（引数の有無に関わらずPowerShell 7で安全にアンパックして評価）
-    $exe = $appCommand[0]
-    $argsLeft = $appCommand | Select-Object -Skip 1
-    & $exe $argsLeft
 }
 
 
