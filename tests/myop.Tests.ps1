@@ -30,6 +30,7 @@ BeforeAll {
 
     # コンテナの保存先をテスト用の一時パスへ差し替える
     $script:OriginalVaultPathEnv = $env:MYOP_VAULT_PATH
+    $script:TestDriveRoot = $TestDrive
     $script:TestVaultPath = Join-Path $TestDrive 'vault.xml'
     $env:MYOP_VAULT_PATH = $script:TestVaultPath
 
@@ -77,6 +78,121 @@ Describe 'コンテナパスの差し替え' {
         # 実コンテナには複数のシークレットが入っているが、差し替えが効いていれば空に見える
         $out = myop-list 6>&1 | Out-String
         $out | Should -Match '登録されているシークレットはありません'
+    }
+}
+
+Describe 'ConvertFrom-MyDotEnv（.env パーサー）' {
+    BeforeAll {
+        # 内部関数のため InModuleScope 経由で呼ぶ。戻り値は常に配列として扱う。
+        function Get-ParsedEnv {
+            param([string[]]$Lines)
+            $file = Join-Path $script:TestDriveRoot "parse-$([guid]::NewGuid().ToString('N')).env"
+            Set-Content -Path $file -Value $Lines
+            @(InModuleScope myop -Parameters @{ P = $file } { param($P) ConvertFrom-MyDotEnv -Path $P })
+        }
+    }
+
+    Context '行の種別' {
+        It 'コメント行は Comment になる' {
+            (Get-ParsedEnv @('# これはコメント'))[0].Kind | Should -Be 'Comment'
+        }
+
+        It '先頭に空白があるコメント行も Comment になる' {
+            (Get-ParsedEnv @('   # 字下げされたコメント'))[0].Kind | Should -Be 'Comment'
+        }
+
+        It '空行は Blank になる' {
+            $r = Get-ParsedEnv @('KEY=value', '', 'OTHER=x')
+            $r[1].Kind | Should -Be 'Blank'
+        }
+
+        It '= を含まない行は Invalid になる' {
+            (Get-ParsedEnv @('equals sign is missing'))[0].Kind | Should -Be 'Invalid'
+        }
+
+        It 'キー名が識別子として不正な行は Invalid になる' {
+            (Get-ParsedEnv @('1KEY=value'))[0].Kind | Should -Be 'Invalid'
+            (Get-ParsedEnv @('KE-Y=value'))[0].Kind | Should -Be 'Invalid'
+        }
+
+        It '通常の代入行は Entry になる' {
+            (Get-ParsedEnv @('KEY=value'))[0].Kind | Should -Be 'Entry'
+        }
+
+        It 'すべての行に元の行がそのまま保持される' {
+            $r = Get-ParsedEnv @('# comment', 'KEY=value')
+            $r[0].RawLine | Should -Be '# comment'
+            $r[1].RawLine | Should -Be 'KEY=value'
+        }
+    }
+
+    Context '値の解釈' {
+        It 'export プレフィックスを剥がす' {
+            $r = (Get-ParsedEnv @('export KEY=value'))[0]
+            $r.Kind  | Should -Be 'Entry'
+            $r.Key   | Should -Be 'KEY'
+            $r.Value | Should -Be 'value'
+        }
+
+        It '最初の = で分割し、値の中の = は残す' {
+            (Get-ParsedEnv @('KEY=a=b'))[0].Value | Should -Be 'a=b'
+        }
+
+        It 'ダブルクォートで囲まれた値はクォートを剥がす' {
+            (Get-ParsedEnv @('KEY="value"'))[0].Value | Should -Be 'value'
+        }
+
+        It 'シングルクォートで囲まれた値はクォートを剥がす' {
+            (Get-ParsedEnv @("KEY='value'"))[0].Value | Should -Be 'value'
+        }
+
+        It '囲まれていないクォートは剥がさない' {
+            (Get-ParsedEnv @('KEY="value'''))[0].Value | Should -Be '"value'''
+        }
+
+        It 'クォート無しの値は 空白 + # 以降をコメントとして落とす' {
+            (Get-ParsedEnv @('KEY=value # コメント'))[0].Value | Should -Be 'value'
+        }
+
+        It '# の直前に空白が無ければ値の一部として扱う' {
+            (Get-ParsedEnv @('KEY=value#tag'))[0].Value | Should -Be 'value#tag'
+        }
+
+        It 'クォートの中の # は値の一部として扱う' {
+            (Get-ParsedEnv @('KEY="value # not comment"'))[0].Value | Should -Be 'value # not comment'
+        }
+
+        It 'クォートを閉じた後ろのコメントは落とす' {
+            (Get-ParsedEnv @('KEY="value" # コメント'))[0].Value | Should -Be 'value'
+        }
+
+        It '値が空なら空文字列になる' {
+            $r = (Get-ParsedEnv @('KEY='))[0]
+            $r.Kind  | Should -Be 'Entry'
+            $r.Value | Should -Be ''
+        }
+
+        It '値の前後の空白は取り除く' {
+            (Get-ParsedEnv @('KEY=   value   '))[0].Value | Should -Be 'value'
+        }
+
+        It 'キーの前後の空白は取り除く' {
+            (Get-ParsedEnv @('  KEY  =value'))[0].Key | Should -Be 'KEY'
+        }
+    }
+
+    Context 'op:// 参照の判定' {
+        It 'op:// で始まる値は IsOpPath が真になる' {
+            (Get-ParsedEnv @('KEY="op://Personal/Item/credential"'))[0].IsOpPath | Should -BeTrue
+        }
+
+        It '平文の値は IsOpPath が偽になる' {
+            (Get-ParsedEnv @('KEY=localhost'))[0].IsOpPath | Should -BeFalse
+        }
+
+        It 'クォートを剥がした結果で判定する' {
+            (Get-ParsedEnv @("KEY='op://Personal/Item/credential'"))[0].IsOpPath | Should -BeTrue
+        }
     }
 }
 
@@ -213,6 +329,19 @@ Describe 'myop-check' {
         $out | Should -Not -Match 'すべてのシークレットが正常に登録されています'
     }
 
+    It '解析できない行は警告を出してスキップする' {
+        $envFile = Join-Path $TestDrive 'check-invalid.env'
+        Set-Content -Path $envFile -Value @(
+            'REGISTERED="op://Personal/Registered/credential"'
+            'no-equals-sign-here'
+        )
+
+        $out = myop-check $envFile *>&1 | Out-String
+
+        $out | Should -Match '解析できない行'
+        $out | Should -Match '\[OK\]'
+    }
+
     It '存在しない .env を指定するとエラーを出力する' {
         $missing = Join-Path $TestDrive 'no-such-file.env'
 
@@ -238,6 +367,24 @@ Describe 'myop-eg' {
         $result | Should -Contain '# コメント行'
         $result | Should -Contain 'API_KEY="op://Personal/OpenAI/credential"'
         $result | Should -Contain 'DB_HOST="your_db_host_here"'
+    }
+
+    It 'export プレフィックスは取り除かれる' {
+        $envFile = Join-Path $TestDrive 'eg-export.env'
+        Set-Content -Path $envFile -Value 'export DB_HOST=localhost'
+
+        myop-eg $envFile 6>&1 | Out-Null
+
+        Get-Content "$envFile.example" | Should -Contain 'DB_HOST="your_db_host_here"'
+    }
+
+    It '行内コメントは値に含めない' {
+        $envFile = Join-Path $TestDrive 'eg-comment.env'
+        Set-Content -Path $envFile -Value 'API_KEY="op://Personal/OpenAI/credential" # 本番用'
+
+        myop-eg $envFile 6>&1 | Out-Null
+
+        Get-Content "$envFile.example" | Should -Contain 'API_KEY="op://Personal/OpenAI/credential"'
     }
 
     It '生成物に平文の値が残らない' {
@@ -346,6 +493,24 @@ Describe 'myop run' {
         $out = myop run --env-file=$envFile -- pwsh -NoProfile -Command '"$env:MYOP_T_SECRET|$env:MYOP_T_PLAIN"'
 
         ($out | Out-String).Trim() | Should -Be 'injected-secret|plain-value'
+    }
+
+    It '行内コメント付きの値はコメントを除いて子プロセスに渡す' {
+        $envFile = Join-Path $TestDrive 'run-comment.env'
+        Set-Content -Path $envFile -Value 'MYOP_T_COMMENT=plain-value # ここはコメント'
+
+        $out = myop run --env-file=$envFile -- pwsh -NoProfile -Command '$env:MYOP_T_COMMENT'
+
+        ($out | Out-String).Trim() | Should -Be 'plain-value'
+    }
+
+    It 'export プレフィックス付きの行も展開する' {
+        $envFile = Join-Path $TestDrive 'run-export.env'
+        Set-Content -Path $envFile -Value 'export MYOP_T_EXPORTED="op://Personal/RunTest/credential"'
+
+        $out = myop run --env-file=$envFile -- pwsh -NoProfile -Command '$env:MYOP_T_EXPORTED'
+
+        ($out | Out-String).Trim() | Should -Be 'injected-secret'
     }
 
     It '未登録の op:// 参照は警告を出す' {

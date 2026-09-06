@@ -16,6 +16,101 @@ function Initialize-MyVault {
 }
 
 # ========================================================
+# 内部用ヘルパー：.env ファイルの解析
+# ========================================================
+# myop-check / myop-eg / myop run から共通で使う。
+# 1 行につき 1 つのオブジェクトを返し、Kind が行の種別を表す。
+#   Entry   … KEY=VALUE として解釈できた行（Key / Value / IsOpPath が有効）
+#   Comment … # で始まる行
+#   Blank   … 空行
+#   Invalid … = が無い、またはキー名が識別子として不正な行
+#
+# 意図的に対応していないもの:
+#   - ダブルクォート内のエスケープシーケンス（\n、\"）の展開
+#   - 複数行にまたがる値
+#   - 変数展開（KEY=${OTHER}）
+function ConvertFrom-MyDotEnv {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lineNumber = 0
+    foreach ($rawLine in (Get-Content -Path $Path)) {
+        $lineNumber++
+
+        $entry = [ordered]@{
+            LineNumber = $lineNumber
+            RawLine    = $rawLine
+            Kind       = 'Invalid'
+            Key        = $null
+            Value      = $null
+            IsOpPath   = $false
+        }
+
+        if ([string]::IsNullOrWhiteSpace($rawLine)) {
+            $entry.Kind = 'Blank'
+            [pscustomobject]$entry
+            continue
+        }
+
+        if ($rawLine -match "^\s*#") {
+            $entry.Kind = 'Comment'
+            [pscustomobject]$entry
+            continue
+        }
+
+        # 行頭の export を取り除く
+        $line = $rawLine -replace "^\s*export\s+", ''
+
+        # 最初の = だけで分割する（値の中の = は値の一部として残す）
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 0) {
+            [pscustomobject]$entry
+            continue
+        }
+
+        $key = $line.Substring(0, $separator).Trim()
+        if ($key -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+            [pscustomobject]$entry
+            continue
+        }
+
+        $value = ConvertFrom-MyDotEnvValue -Raw $line.Substring($separator + 1)
+
+        $entry.Kind     = 'Entry'
+        $entry.Key      = $key
+        $entry.Value    = $value
+        $entry.IsOpPath = $value.StartsWith('op://')
+        [pscustomobject]$entry
+    }
+}
+
+# 内部用ヘルパー：.env の値部分を解釈する（クォートと行内コメントの扱い）
+function ConvertFrom-MyDotEnvValue {
+    param([string]$Raw)
+
+    $trimmed = $Raw.Trim()
+    if ($trimmed.Length -eq 0) { return '' }
+
+    $quote = $trimmed[0]
+    if ($quote -eq '"' -or $quote -eq "'") {
+        $closing = $trimmed.IndexOf($quote, 1)
+        if ($closing -gt 0) {
+            # 閉じクォートの後ろが空白かコメントだけなら、クォートで囲まれた値とみなす
+            if ($trimmed.Substring($closing + 1) -match "^\s*(#.*)?$") {
+                return $trimmed.Substring(1, $closing - 1)
+            }
+        }
+        # 閉じていない、または後ろに別の内容が続く場合はクォートを剥がさない
+    }
+
+    # クォートで囲まれていない値は、空白 + # 以降を行内コメントとして落とす
+    $comment = [regex]::Match($trimmed, "\s+#")
+    if ($comment.Success) {
+        return $trimmed.Substring(0, $comment.Index).TrimEnd()
+    }
+    return $trimmed
+}
+
+# ========================================================
 # 保存・上書き (myop-save)
 # ========================================================
 function myop-save {
@@ -86,20 +181,18 @@ function myop-check {
     $allOk = $true
     Write-Host "[$EnvFilePath] のシークレットチェックを開始します..." -ForegroundColor Cyan
 
-    Get-Content $EnvFilePath | ForEach-Object {
-        if ($_ -match "^\s*#" -or [string]::IsNullOrWhiteSpace($_)) { return }
-        if ($_ -match "^([^=]+)=(.*)$") {
-            $key = $Matches[1].Trim()
-            $value = $Matches[2].Trim().Trim('"').Trim("'")
+    foreach ($entry in (ConvertFrom-MyDotEnv -Path $EnvFilePath)) {
+        if ($entry.Kind -eq 'Invalid') {
+            Write-Warning "解析できない行をスキップしました（$($entry.LineNumber) 行目）: $($entry.RawLine)"
+            continue
+        }
+        if ($entry.Kind -ne 'Entry' -or -not $entry.IsOpPath) { continue }
 
-            if ($value.StartsWith("op://")) {
-                if ($vaultData.ContainsKey($value)) {
-                    Write-Host "[OK] $key -> $value" -ForegroundColor Green
-                } else {
-                    Write-Host "[NG] $key -> コンテナ未登録: $value" -ForegroundColor Red
-                    $allOk = $false
-                }
-            }
+        if ($vaultData.ContainsKey($entry.Value)) {
+            Write-Host "[OK] $($entry.Key) -> $($entry.Value)" -ForegroundColor Green
+        } else {
+            Write-Host "[NG] $($entry.Key) -> コンテナ未登録: $($entry.Value)" -ForegroundColor Red
+            $allOk = $false
         }
     }
     if ($allOk) { Write-Host "すべてのシークレットが正常に登録されています！" -ForegroundColor Green }
@@ -129,31 +222,19 @@ function myop-eg {
     $outputLines = [System.Collections.Generic.List[string]]::new()
 
     # 3. 1行ずつ解析して置換
-    Get-Content $EnvFilePath | ForEach-Object {
-        $line = $_
-
-        # コメント行や空行はそのまま維持
-        if ($line -match "^\s*#" -or [string]::IsNullOrWhiteSpace($line)) {
-            $outputLines.Add($line)
-            return
+    foreach ($entry in (ConvertFrom-MyDotEnv -Path $EnvFilePath)) {
+        # コメント行・空行・解析できない行は原文のまま維持する
+        if ($entry.Kind -ne 'Entry') {
+            $outputLines.Add($entry.RawLine)
+            continue
         }
 
-        # KEY=VALUE の構造を解析
-        if ($line -match "^([^=]+)=(.*)$") {
-            $key = $Matches[1].Trim()
-            $value = $Matches[2].Trim().Trim('"').Trim("'")
-
-            if ($value.StartsWith("op://")) {
-                # 値が op:// のものはそのまま保持
-                $outputLines.Add("${key}=`"${value}`"")
-            } else {
-                # 平文の場合は your_<環境変数名を小文字にしたもの>_here に置換
-                $lowerKey = $key.ToLower()
-                $outputLines.Add("${key}=`"your_${lowerKey}_here`"")
-            }
+        if ($entry.IsOpPath) {
+            # 値が op:// のものはそのまま保持
+            $outputLines.Add("$($entry.Key)=`"$($entry.Value)`"")
         } else {
-            # 解析できない行もそのまま残す
-            $outputLines.Add($line)
+            # 平文の場合は your_<環境変数名を小文字にしたもの>_here に置換
+            $outputLines.Add("$($entry.Key)=`"your_$($entry.Key.ToLower())_here`"")
         }
     }
 
@@ -345,30 +426,26 @@ function myop {
 
     # 5. シークレットの展開と環境変数への注入
     $vaultData = Initialize-MyVault
-    Get-Content $envFilePath | ForEach-Object {
-        if ($_ -match "^\s*#" -or [string]::IsNullOrWhiteSpace($_)) { return }
-        if ($_ -match "^([^=]+)=(.*)$") {
-            $key = $Matches[1].Trim()
-            $value = $Matches[2].Trim().Trim('"').Trim("'")
+    foreach ($entry in (ConvertFrom-MyDotEnv -Path $envFilePath)) {
+        if ($entry.Kind -ne 'Entry') { continue }
 
-            if ($value.StartsWith("op://")) {
-                if ($vaultData.ContainsKey($value)) {
-                    $SecureSecret = $vaultData[$value]
-                    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
-                    try {
-                        $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-                        [System.Environment]::SetEnvironmentVariable($key, $PlainSecret, "Process")
-                    }
-                    finally {
-                        # 非管理メモリ上の平文をゼロ埋めして解放する
-                        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-                    }
-                } else {
-                    Write-Warning "暗号化コンテナ内に該当するパスが見つかりません: $value"
+        if ($entry.IsOpPath) {
+            if ($vaultData.ContainsKey($entry.Value)) {
+                $SecureSecret = $vaultData[$entry.Value]
+                $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
+                try {
+                    $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+                    [System.Environment]::SetEnvironmentVariable($entry.Key, $PlainSecret, "Process")
+                }
+                finally {
+                    # 非管理メモリ上の平文をゼロ埋めして解放する
+                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
                 }
             } else {
-                [System.Environment]::SetEnvironmentVariable($key, $value, "Process")
+                Write-Warning "暗号化コンテナ内に該当するパスが見つかりません: $($entry.Value)"
             }
+        } else {
+            [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
         }
     }
 
