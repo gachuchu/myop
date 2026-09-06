@@ -1,12 +1,16 @@
 # ========================================================
 # 共通設定：暗号化コンテナの保存パス
 # ========================================================
-$MyVaultPath = "$HOME\.my_vault.xml"
+# テスト時は環境変数 MYOP_VAULT_PATH でコンテナの保存先を差し替えられる
+function Get-MyVaultPath {
+    if ($env:MYOP_VAULT_PATH) { return $env:MYOP_VAULT_PATH }
+    return "$HOME\.my_vault.xml"
+}
 
 # 内部用ヘルパー：コンテナの読み込み
 function Initialize-MyVault {
-    if (Test-Path $MyVaultPath) {
-        return Import-CliXml -Path $MyVaultPath
+    if (Test-Path (Get-MyVaultPath)) {
+        return Import-CliXml -Path (Get-MyVaultPath)
     }
     return @{}
 }
@@ -29,7 +33,7 @@ function myop-save {
 
     $SecureSecret = Read-Host -AsSecureString "$OpPath の値を入力してください"
     $vaultData[$OpPath] = $SecureSecret
-    $vaultData | Export-CliXml -Path $MyVaultPath
+    $vaultData | Export-CliXml -Path (Get-MyVaultPath)
     Write-Host "保存・上書きが完了しました: $OpPath" -ForegroundColor Green
 }
 
@@ -44,7 +48,7 @@ function myop-remove {
         $confirmation = Read-Host "$OpPath を本当に削除しますか？ (y/N)"
         if ($confirmation -eq 'y' -or $confirmation -eq 'Y') {
             $vaultData.Remove($OpPath)
-            $vaultData | Export-CliXml -Path $MyVaultPath
+            $vaultData | Export-CliXml -Path (Get-MyVaultPath)
             Write-Host "削除しました: $OpPath" -ForegroundColor Green
         }
     } else {
@@ -187,7 +191,7 @@ function ConvertTo-MyVaultAesKey {
 function myop-export {
     param([string]$OutPath = "$HOME\Desktop\my_vault_migration.xml")
 
-    if (-not (Test-Path $MyVaultPath)) {
+    if (-not (Test-Path (Get-MyVaultPath))) {
         Write-Error "エクスポートするデータがありません。"
         return
     }
@@ -261,7 +265,7 @@ function myop-import {
         }
 
         # 新PCのユーザーアカウント（DPAPI）で自動再暗号化して保存
-        $vaultData | Export-CliXml -Path $MyVaultPath
+        $vaultData | Export-CliXml -Path (Get-MyVaultPath)
 
         Write-Host "`n新PCへのシークレット移行が完全に成功しました！" -ForegroundColor Green
     }
