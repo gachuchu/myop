@@ -267,6 +267,27 @@ function ConvertTo-MyVaultAesKey {
 }
 
 # ========================================================
+# 内部用ヘルパー：2 つの SecureString が同じ文字列かを比較する
+# ========================================================
+function Test-MyVaultPasswordMatch {
+    param(
+        [Parameter(Mandatory=$true)][securestring]$First,
+        [Parameter(Mandatory=$true)][securestring]$Second
+    )
+    $firstBstr  = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($First)
+    $secondBstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Second)
+    try {
+        $firstPlain  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($firstBstr)
+        $secondPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($secondBstr)
+        return $firstPlain -ceq $secondPlain
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($firstBstr)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secondBstr)
+    }
+}
+
+# ========================================================
 # PC移行用エクスポート (myop-export)
 # ========================================================
 function myop-export {
@@ -282,6 +303,13 @@ function myop-export {
     $securePassword = Read-Host -AsSecureString "移行用パスワードを入力"
     if ($securePassword.Length -eq 0) {
         Write-Error "パスワードが空のため、エクスポートを中止しました。"
+        return
+    }
+
+    # 打ち間違えたまま書き出すと新PCで復号できなくなるため、2回目の入力と突き合わせる
+    $confirmPassword = Read-Host -AsSecureString "確認のためもう一度入力"
+    if (-not (Test-MyVaultPasswordMatch -First $securePassword -Second $confirmPassword)) {
+        Write-Error "パスワードが一致しません。エクスポートを中止しました。"
         return
     }
 
@@ -345,8 +373,23 @@ function myop-import {
             $vaultData[$opPath] = ConvertTo-SecureString -String $payload.Data[$opPath] -Key $keyBytes -ErrorAction Stop
         }
 
+        # ここまで来れば復号は成功している。既存のコンテナがあれば扱いを確認する
+        $vaultPath = Get-MyVaultPath
+        if (Test-Path $vaultPath) {
+            $confirmation = Read-Host "既存のコンテナを上書きします。よろしいですか？ (y/N)"
+            if ($confirmation -ne 'y' -and $confirmation -ne 'Y') {
+                Write-Host "インポートを中止しました。コンテナは変更していません。" -ForegroundColor Yellow
+                return
+            }
+
+            # 書き込む直前にバックアップを取る（パスワード誤りで無駄に上書きしないため）
+            $backupPath = "$vaultPath.bak"
+            Copy-Item -Path $vaultPath -Destination $backupPath -Force
+            Write-Host "取り込み前のコンテナをバックアップしました: $backupPath" -ForegroundColor Yellow
+        }
+
         # 新PCのユーザーアカウント（DPAPI）で自動再暗号化して保存
-        $vaultData | Export-CliXml -Path (Get-MyVaultPath)
+        $vaultData | Export-CliXml -Path $vaultPath
 
         Write-Host "`n新PCへのシークレット移行が完全に成功しました！" -ForegroundColor Green
     }
