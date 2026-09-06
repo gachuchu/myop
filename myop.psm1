@@ -355,8 +355,14 @@ function myop {
                 if ($vaultData.ContainsKey($value)) {
                     $SecureSecret = $vaultData[$value]
                     $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
-                    $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-                    [System.Environment]::SetEnvironmentVariable($key, $PlainSecret, "Process")
+                    try {
+                        $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+                        [System.Environment]::SetEnvironmentVariable($key, $PlainSecret, "Process")
+                    }
+                    finally {
+                        # 非管理メモリ上の平文をゼロ埋めして解放する
+                        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+                    }
                 } else {
                     Write-Warning "暗号化コンテナ内に該当するパスが見つかりません: $value"
                 }
