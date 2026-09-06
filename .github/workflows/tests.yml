@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pester:
+    name: Pester (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Pester をインストール
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 6.1.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: テストを実行
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 6.0.0
+          Invoke-Pester -Path ./tests -Output Detailed -CI
