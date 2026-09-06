@@ -9,6 +9,13 @@
 #   最後の Describe で、実コンテナが変化していないことを検証している。
 
 BeforeAll {
+    # GitHub Actions の pwsh シェルは既定で $ErrorActionPreference = 'Stop' を設定する。
+    # そのままだと myop 側の Write-Error が終了エラーになり、
+    # 「エラーメッセージを出力すること」を検証するテストが例外で落ちてしまう。
+    # ローカルと CI で同じ結果になるよう、スイート実行中は Continue に固定する。
+    $script:OriginalErrorActionPreference = $global:ErrorActionPreference
+    $global:ErrorActionPreference = 'Continue'
+
     $script:ModulePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'myop.psm1'
 
     # 実ユーザーのコンテナを保護するため、テスト開始前の状態を記録しておく
@@ -55,6 +62,7 @@ BeforeAll {
 AfterAll {
     Remove-Module myop -Force -ErrorAction SilentlyContinue
     $env:MYOP_VAULT_PATH = $script:OriginalVaultPathEnv
+    $global:ErrorActionPreference = $script:OriginalErrorActionPreference
 }
 
 Describe 'コンテナパスの差し替え' {
