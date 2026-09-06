@@ -475,6 +475,109 @@ Describe 'myop-export / myop-import' {
 
         (Get-FileHash $script:TestVaultPath -Algorithm SHA256).Hash | Should -Be $hashBefore
     }
+
+    Context 'エクスポート時のパスワード確認入力' {
+        BeforeEach {
+            Remove-TestVault
+            Set-TestVault @{ 'op://Personal/A/credential' = 'a' }
+        }
+
+        It '2 回の入力が一致すればエクスポートできる' {
+            $exportPath = Join-Path $TestDrive 'pw-match.xml'
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'same-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+
+            myop-export $exportPath 6>&1 | Out-Null
+
+            Test-Path $exportPath | Should -BeTrue
+        }
+
+        It '2 回の入力が一致しなければ中止しファイルを作らない' {
+            $exportPath = Join-Path $TestDrive 'pw-mismatch.xml'
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'first-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString -and $Prompt -notlike '*確認*' }
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'different-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString -and $Prompt -like '*確認*' }
+
+            $err = myop-export $exportPath 2>&1 | Out-String
+
+            $err | Should -Match 'パスワードが一致しません'
+            Test-Path $exportPath | Should -BeFalse
+        }
+    }
+
+    Context 'インポート時の既存コンテナの保護' {
+        BeforeAll {
+            # 移行元のデータを用意してエクスポートするまでを共通化する。
+            # Read-Host の Mock は呼び出し側の It で定義する
+            # （関数の中で定義するとその関数のスコープに閉じてしまうため）。
+            function New-TestMigrationFile {
+                param([string]$Name)
+                Set-TestVault @{ 'op://Personal/FromExport/credential' = 'exported-value' }
+                $path = Join-Path $script:TestDriveRoot $Name
+                myop-export $path 6>&1 | Out-Null
+                return $path
+            }
+        }
+
+        BeforeEach {
+            Remove-TestVault
+            $script:BackupPath = "$script:TestVaultPath.bak"
+            if (Test-Path $script:BackupPath) { Remove-Item $script:BackupPath -Force }
+        }
+
+        It 'y を選ぶと上書きし、取り込み前の内容をバックアップに残す' {
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'migration-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+            $exportPath = New-TestMigrationFile -Name 'protect-yes.xml'
+
+            Set-TestVault @{ 'op://Personal/Existing/credential' = 'will-be-replaced' }
+            $hashBefore = (Get-FileHash $script:TestVaultPath -Algorithm SHA256).Hash
+
+            Mock -ModuleName myop Read-Host { 'y' } -ParameterFilter { -not $AsSecureString }
+            myop-import $exportPath 6>&1 | Out-Null
+
+            Get-TestVaultValue 'op://Personal/FromExport/credential' | Should -Be 'exported-value'
+            Test-Path $script:BackupPath | Should -BeTrue
+            (Get-FileHash $script:BackupPath -Algorithm SHA256).Hash | Should -Be $hashBefore
+        }
+
+        It 'N を選ぶとコンテナもバックアップも作らず中止する' {
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'migration-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+            $exportPath = New-TestMigrationFile -Name 'protect-no.xml'
+
+            Set-TestVault @{ 'op://Personal/Existing/credential' = 'must-survive' }
+            $hashBefore = (Get-FileHash $script:TestVaultPath -Algorithm SHA256).Hash
+
+            Mock -ModuleName myop Read-Host { 'n' } -ParameterFilter { -not $AsSecureString }
+            myop-import $exportPath 6>&1 | Out-Null
+
+            (Get-FileHash $script:TestVaultPath -Algorithm SHA256).Hash | Should -Be $hashBefore
+            Get-TestVaultValue 'op://Personal/Existing/credential' | Should -Be 'must-survive'
+            Test-Path $script:BackupPath | Should -BeFalse
+        }
+
+        It 'コンテナが無ければ確認もバックアップもせずに取り込む' {
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'migration-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+            $exportPath = New-TestMigrationFile -Name 'protect-none.xml'
+            Remove-TestVault
+
+            myop-import $exportPath 6>&1 | Out-Null
+
+            Get-TestVaultValue 'op://Personal/FromExport/credential' | Should -Be 'exported-value'
+            Test-Path $script:BackupPath | Should -BeFalse
+        }
+
+        It '誤ったパスワードならバックアップも作らない' {
+            # バックアップは復号に成功してから取るため、失敗時は作られない
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'right-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+            $exportPath = New-TestMigrationFile -Name 'protect-badpw.xml'
+
+            Set-TestVault @{ 'op://Personal/Existing/credential' = 'must-survive' }
+
+            Mock -ModuleName myop Read-Host { ConvertTo-SecureString 'wrong-password' -AsPlainText -Force } -ParameterFilter { $AsSecureString }
+            myop-import $exportPath 2>&1 | Out-Null
+
+            Test-Path $script:BackupPath | Should -BeFalse
+            Get-TestVaultValue 'op://Personal/Existing/credential' | Should -Be 'must-survive'
+        }
+    }
 }
 
 Describe 'myop run' {
